@@ -57,39 +57,48 @@ async function startPairing(mode, phoneNumber) {
     printQRInTerminal: false,
     logger:            pino({ level: 'silent' }),
     browser:           ['APEX-MD', 'Chrome', '120.0.0'],
-    mobile: mode === 'code',
+    // never set mobile:true — it breaks pairing code flow on newer Baileys
   });
 
   state.sock = sock;
   sock.ev.on('creds.update', saveCreds);
 
+  // ── Request pairing code as soon as socket registers (before open) ──
+  if (mode === 'code' && phoneNumber) {
+    sock.ev.on('connection.update', async (update) => {
+      // requestPairingCode must be called when not yet registered
+      if (update.qr && !state.pairCode) {
+        try {
+          const num  = phoneNumber.replace(/\D/g, '');
+          const code = await sock.requestPairingCode(num);
+          state.pairCode = code;
+          state.status   = 'code_ready';
+          log.info(`[Pair] Pairing code issued: ${code}`);
+        } catch (e) {
+          state.error  = e.message;
+          state.status = 'error';
+          log.error('[Pair] Pairing code error:', e.message);
+        }
+      }
+    });
+  }
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // ── QR ──────────────────────────────────────────────────
+    // ── QR (only show in QR mode) ────────────────────────────
     if (qr && mode === 'qr') {
       state.status = 'qr_ready';
       try {
         state.qrDataUrl = await QRCode.toDataURL(qr, {
-          errorCorrectionLevel: 'H', margin: 2,
+          errorCorrectionLevel: 'M',
+          margin: 3,
           color: { dark: '#000000', light: '#ffffff' },
-          width: 300,
+          width: 512,  // big, crisp, scannable
+          scale: 10,
         });
-        log.info('[Pair] QR code generated');
+        log.info('[Pair] QR code generated (512px)');
       } catch (e) { log.error('[Pair] QR error:', e.message); }
-    }
-
-    // ── Pairing code ─────────────────────────────────────────
-    if (connection === 'open' && mode === 'code' && phoneNumber && !state.pairCode) {
-      try {
-        const code = await sock.requestPairingCode(phoneNumber.replace(/\D/g, ''));
-        state.pairCode = code;
-        state.status   = 'code_ready';
-        log.info(`[Pair] Pairing code: ${code}`);
-      } catch (e) {
-        state.error  = e.message;
-        state.status = 'error';
-      }
     }
 
     // ── Paired ───────────────────────────────────────────────
@@ -203,8 +212,10 @@ input::placeholder{color:#555}
 .btn:hover{background:#1ebe5d}
 .btn:disabled{background:#1a1a1a;color:#444;cursor:not-allowed}
 .qr-wrap{margin:20px auto 0;text-align:center}
-.qr-wrap img{border-radius:12px;border:3px solid #25d366;max-width:260px;width:100%}
+.qr-wrap img{border-radius:12px;border:3px solid #25d366;max-width:340px;width:100%;
+             image-rendering:pixelated}
 .qr-hint{font-size:.78rem;color:#555;margin-top:10px}
+.qr-timer{font-size:.75rem;color:#25d366;margin-top:4px;font-weight:600}
 .code-box{margin-top:20px;background:#1a1a1a;border-radius:12px;
           border:2px solid #25d366;padding:20px}
 .code-label{font-size:.75rem;color:#25d366;font-weight:700;
@@ -260,7 +271,8 @@ input::placeholder{color:#555}
     <button class="btn" id="qrBtn" onclick="startQR()">Generate QR Code</button>
     <div class="qr-wrap" id="qrWrap" style="display:none">
       <img id="qrImg" src="" alt="QR Code"/>
-      <div class="qr-hint">QR refreshes every 20s — scan quickly</div>
+      <div class="qr-hint">WhatsApp → Linked Devices → Link a Device → scan</div>
+      <div class="qr-timer" id="qrTimer"></div>
     </div>
   </div>
 
@@ -297,6 +309,8 @@ input::placeholder{color:#555}
 <script>
 let mode = 'qr';
 let pollTimer = null;
+let qrCountdown = null;
+let lastQrSrc = null;
 
 function sw(m) {
   mode = m;
@@ -310,14 +324,15 @@ async function startQR() {
   setStatus('info','<span class="spinner"></span>Connecting to WhatsApp...');
   document.getElementById('qrBtn').disabled = true;
   document.getElementById('qrWrap').style.display = 'none';
+  lastQrSrc = null;
   await fetch('/start/qr', {method:'POST'});
   startPolling();
 }
 
 async function startCode() {
   const phone = document.getElementById('phoneIn').value.trim().replace(/\\D/g,'');
-  if (!phone || phone.length < 7) { setStatus('error','Enter a valid phone number'); return; }
-  setStatus('info','<span class="spinner"></span>Requesting pairing code...');
+  if (!phone || phone.length < 7) { setStatus('error','Enter a valid phone number (e.g. 2348012345678)'); return; }
+  setStatus('info','<span class="spinner"></span>Connecting — pairing code coming in ~5s...');
   document.getElementById('codeBtn').disabled = true;
   await fetch('/start/code', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({phone})});
   startPolling();
@@ -325,46 +340,77 @@ async function startCode() {
 
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(poll, 1500);
+  pollTimer = setInterval(poll, 1200);
 }
 
 async function poll() {
   let r;
   try { r = await fetch('/state').then(x=>x.json()); } catch(_) { return; }
 
-  if (r.status === 'qr_ready' && r.qrDataUrl) {
-    document.getElementById('qrImg').src = r.qrDataUrl;
+  // ── QR updated ──────────────────────────────────────────────
+  if (r.status === 'qr_ready' && r.qrDataUrl && r.qrDataUrl !== lastQrSrc) {
+    lastQrSrc = r.qrDataUrl;
+    const img = document.getElementById('qrImg');
+    img.src = r.qrDataUrl;
     document.getElementById('qrWrap').style.display = 'block';
     setStatus('info','📷 Scan the QR code with WhatsApp');
+    startQrTimer(20);
   }
 
+  // ── Pairing code ready ──────────────────────────────────────
   if (r.status === 'code_ready' && r.pairCode) {
-    document.getElementById('codeNum').textContent = r.pairCode;
+    // Format code as XXXX-XXXX if 8 digits
+    const raw = r.pairCode.replace(/-/g,'');
+    const fmt = raw.length === 8 ? raw.slice(0,4)+'-'+raw.slice(4) : r.pairCode;
+    document.getElementById('codeNum').textContent = fmt;
     document.getElementById('codeBox').style.display = 'block';
-    setStatus('info','🔑 Enter the pairing code in WhatsApp');
+    setStatus('info','🔑 Enter this code in WhatsApp → Linked Devices → Link a Device → Link with phone number instead');
   }
 
   if (r.status === 'encoding') {
-    setStatus('info','<span class="spinner"></span>Encoding session...');
+    stopQrTimer();
+    setStatus('info','<span class="spinner"></span>Session encoding...');
   }
 
+  // ── Paired! ─────────────────────────────────────────────────
   if (r.status === 'paired' && r.sessionId) {
     clearInterval(pollTimer);
-    setStatus('ok','✅ Paired! Copy your SESSION_ID below.');
+    stopQrTimer();
+    setStatus('ok','✅ Paired successfully! Your SESSION_ID is ready.');
     document.getElementById('sessionVal').textContent = r.sessionId;
     document.getElementById('sessionBox').style.display = 'block';
     document.getElementById('resetBtn').style.display  = 'block';
-    document.getElementById('qrBtn').disabled  = false;
+    document.getElementById('qrBtn').disabled   = false;
     document.getElementById('codeBtn').disabled = false;
   }
 
+  // ── Error ───────────────────────────────────────────────────
   if (r.status === 'error') {
     clearInterval(pollTimer);
-    setStatus('error', '❌ ' + (r.error || 'Unknown error'));
-    document.getElementById('resetBtn').style.display = 'block';
-    document.getElementById('qrBtn').disabled  = false;
+    stopQrTimer();
+    setStatus('error','❌ ' + (r.error || 'Unknown error — try again'));
+    document.getElementById('resetBtn').style.display  = 'block';
+    document.getElementById('qrBtn').disabled   = false;
     document.getElementById('codeBtn').disabled = false;
   }
+}
+
+function startQrTimer(sec) {
+  stopQrTimer();
+  let s = sec;
+  const el = document.getElementById('qrTimer');
+  el.textContent = 'Expires in ' + s + 's';
+  qrCountdown = setInterval(() => {
+    s--;
+    if (s <= 0) { el.textContent = 'Refreshing QR...'; stopQrTimer(); }
+    else el.textContent = 'Expires in ' + s + 's';
+  }, 1000);
+}
+
+function stopQrTimer() {
+  if (qrCountdown) { clearInterval(qrCountdown); qrCountdown = null; }
+  const el = document.getElementById('qrTimer');
+  if (el) el.textContent = '';
 }
 
 function setStatus(type, msg) {
@@ -376,6 +422,7 @@ function setStatus(type, msg) {
 
 async function doReset() {
   if (pollTimer) clearInterval(pollTimer);
+  stopQrTimer();
   await fetch('/reset', {method:'POST'});
   location.reload();
 }
@@ -385,7 +432,16 @@ function copySession() {
   navigator.clipboard.writeText(val).then(() => {
     const btn = document.querySelector('.copy-btn');
     btn.textContent = '✅ Copied!';
-    setTimeout(() => btn.textContent = '📋 Copy SESSION_ID', 2000);
+    setTimeout(() => btn.textContent = '📋 Copy SESSION_ID', 2500);
+  }).catch(() => {
+    // fallback for non-HTTPS
+    const ta = document.createElement('textarea');
+    ta.value = val; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy');
+    document.body.removeChild(ta);
+    const btn = document.querySelector('.copy-btn');
+    btn.textContent = '✅ Copied!';
+    setTimeout(() => btn.textContent = '📋 Copy SESSION_ID', 2500);
   });
 }
 </script>
