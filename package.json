@@ -1,0 +1,24 @@
+{
+  "name": "apex-md-pairing",
+  "version": "1.0.0",
+  "description": "APEX-MD WhatsApp Pairing Site — QR code + pairing code. Deploy on Render to get SESSION_ID.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pino": "^9.2.0",
+    "qrcode": "^1.5.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
